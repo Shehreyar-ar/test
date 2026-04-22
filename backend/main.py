@@ -8,12 +8,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-GEMINI_MODEL   = "gemini-2.0-flash"
-GEMINI_URL     = (
-    f"https://generativelanguage.googleapis.com/v1beta"
-    f"/models/{GEMINI_MODEL}:streamGenerateContent"
-)
+OLLAMA_URL   = os.getenv("OLLAMA_URL", "http://localhost:11434")
+TEXT_MODEL   = os.getenv("TEXT_MODEL",   "gemma3")
+VISION_MODEL = os.getenv("VISION_MODEL", "llava")
 
 app = FastAPI()
 
@@ -32,38 +29,34 @@ SYSTEM_PROMPT = (
     "Be warm, clear, and genuinely helpful."
 )
 
-# session_id -> list of Gemini-format content dicts
+# session_id -> list of Ollama-format message dicts
 sessions: dict[str, list] = {}
 
 
-def _blocking_stream(history: list) -> list[str]:
-    """Calls the Gemini streaming REST API and returns a list of text chunks."""
-    url = f"{GEMINI_URL}?key={GOOGLE_API_KEY}&alt=sse"
+def _blocking_stream(messages: list, model: str) -> list[str]:
+    """Calls Ollama /api/chat with streaming and returns list of text chunks."""
+    url = f"{OLLAMA_URL}/api/chat"
     payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": history,
-        "generationConfig": {"maxOutputTokens": 1024},
+        "model":    model,
+        "system":   SYSTEM_PROMPT,
+        "messages": messages,
+        "stream":   True,
     }
 
     chunks: list[str] = []
-    with requests.post(url, json=payload, stream=True, timeout=60) as resp:
+    with requests.post(url, json=payload, stream=True, timeout=120) as resp:
         resp.raise_for_status()
         for raw_line in resp.iter_lines():
             if not raw_line:
                 continue
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-            if not line.startswith("data: "):
-                continue
-            data = line[6:]
-            if data == "[DONE]":
-                break
             try:
-                obj = json.loads(data)
-                for candidate in obj.get("candidates", []):
-                    for part in candidate.get("content", {}).get("parts", []):
-                        text = part.get("text", "")
-                        if text:
-                            chunks.append(text)
+                obj = json.loads(line)
+                text = obj.get("message", {}).get("content", "")
+                if text:
+                    chunks.append(text)
+                if obj.get("done"):
+                    break
             except json.JSONDecodeError:
                 continue
 
@@ -82,33 +75,30 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             raw = await websocket.receive_text()
             payload = json.loads(raw)
 
-            user_text: str  = payload.get("message", "").strip()
+            user_text: str       = payload.get("message", "").strip()
             image_b64: str | None = payload.get("image")
 
-            parts: list = []
+            if not user_text and not image_b64:
+                continue
+
+            # Build the Ollama message
+            msg: dict = {"role": "user", "content": user_text or "What do you see on my screen?"}
 
             if image_b64:
                 if "," in image_b64:
                     image_b64 = image_b64.split(",", 1)[1]
-                parts.append({
-                    "inline_data": {"mime_type": "image/png", "data": image_b64}
-                })
+                msg["images"] = [image_b64]
 
-            if user_text:
-                parts.append({"text": user_text})
+            sessions[session_id].append(msg)
+            model = VISION_MODEL if image_b64 else TEXT_MODEL
 
-            if not parts:
-                continue
-
-            sessions[session_id].append({"role": "user", "parts": parts})
-
-            # Run blocking HTTP stream in a thread
-            loop = asyncio.get_event_loop()
+            # Stream response via thread + queue
+            loop  = asyncio.get_event_loop()
             queue: asyncio.Queue[str | None] = asyncio.Queue()
 
             def _run():
                 try:
-                    for chunk in _blocking_stream(sessions[session_id]):
+                    for chunk in _blocking_stream(sessions[session_id], model):
                         loop.call_soon_threadsafe(queue.put_nowait, chunk)
                 except Exception as exc:
                     loop.call_soon_threadsafe(queue.put_nowait, f"\n\n[Error: {exc}]")
@@ -127,7 +117,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             await future
 
-            sessions[session_id].append({"role": "model", "parts": [{"text": full_response}]})
+            sessions[session_id].append({"role": "assistant", "content": full_response})
             await websocket.send_json({"type": "done", "content": full_response})
 
     except WebSocketDisconnect:
