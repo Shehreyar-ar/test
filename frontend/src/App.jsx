@@ -138,7 +138,7 @@ export default function App() {
 
       <div className="main">
         <header className="topbar">
-          <span className="model-badge">claude-sonnet-4-6</span>
+          <span className="model-badge">gemini-2.0-flash</span>
           <span className={`status-dot ${isConnected ? 'connected' : 'disconnected'}`} />
         </header>
 

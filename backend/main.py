@@ -1,12 +1,17 @@
 import os
 import json
-import uuid
+import base64
+import io
+import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-import anthropic
+import google.generativeai as genai
+from PIL import Image
 from dotenv import load_dotenv
 
 load_dotenv()
+
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 app = FastAPI()
 
@@ -18,24 +23,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-sessions: dict[str, list] = {}
-
 SYSTEM_PROMPT = (
-    "You are a helpful, friendly AI assistant similar to Gemini. "
-    "You can see the user's screen when they share it with you — describe what you see and answer questions about it. "
+    "You are a helpful, friendly AI assistant. "
+    "You can see the user's screen when they share it — describe what you see and answer questions about it. "
     "When responding in voice mode, keep answers concise and natural for spoken conversation. "
     "Be warm, clear, and genuinely helpful."
 )
+
+MODEL_NAME = "gemini-2.0-flash"
+
+# session_id → list of conversation turns (for history)
+sessions: dict[str, genai.ChatSession] = {}
+
+
+def make_chat() -> genai.ChatSession:
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        system_instruction=SYSTEM_PROMPT,
+    )
+    return model.start_chat(history=[])
+
+
+async def stream_gemini(chat: genai.ChatSession, parts: list):
+    """Run the blocking Gemini stream in a thread and yield chunks via a queue."""
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def _blocking():
+        try:
+            response = chat.send_message(parts, stream=True)
+            for chunk in response:
+                text = getattr(chunk, "text", None)
+                if text:
+                    loop.call_soon_threadsafe(queue.put_nowait, text)
+        except Exception as exc:
+            loop.call_soon_threadsafe(queue.put_nowait, f"\n\n[Error: {exc}]")
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    future = loop.run_in_executor(None, _blocking)
+
+    while True:
+        chunk = await queue.get()
+        if chunk is None:
+            break
+        yield chunk
+
+    await future
 
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
 
-    if session_id not in sessions:
-        sessions[session_id] = []
+    chat = sessions.get(session_id) or make_chat()
+    sessions[session_id] = chat
 
     try:
         while True:
@@ -45,46 +87,30 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             user_text: str = payload.get("message", "").strip()
             image_b64: str | None = payload.get("image")
 
-            message_content: list = []
+            parts: list = []
 
             if image_b64:
-                # Strip data-URL prefix if present
                 if "," in image_b64:
                     image_b64 = image_b64.split(",", 1)[1]
-                message_content.append({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": image_b64,
-                    },
-                })
+                img_bytes = base64.b64decode(image_b64)
+                img = Image.open(io.BytesIO(img_bytes))
+                parts.append(img)
 
             if user_text:
-                message_content.append({"type": "text", "text": user_text})
+                parts.append(user_text)
 
-            if not message_content:
+            if not parts:
                 continue
-
-            sessions[session_id].append({"role": "user", "content": message_content})
 
             full_response = ""
             try:
-                with client.messages.stream(
-                    model="claude-sonnet-4-6",
-                    max_tokens=1024,
-                    system=SYSTEM_PROMPT,
-                    messages=sessions[session_id],
-                ) as stream:
-                    for chunk in stream.text_stream:
-                        full_response += chunk
-                        await websocket.send_json({"type": "stream", "content": chunk})
-            except anthropic.APIError as e:
+                async for chunk in stream_gemini(chat, parts):
+                    full_response += chunk
+                    await websocket.send_json({"type": "stream", "content": chunk})
+            except Exception as e:
                 await websocket.send_json({"type": "error", "content": str(e)})
-                sessions[session_id].pop()
                 continue
 
-            sessions[session_id].append({"role": "assistant", "content": full_response})
             await websocket.send_json({"type": "done", "content": full_response})
 
     except WebSocketDisconnect:

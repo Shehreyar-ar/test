@@ -9,16 +9,16 @@ if [ ! -f "$ROOT/backend/.env" ]; then
   echo ""
   echo "  ┌─────────────────────────────────────────────────────┐"
   echo "  │  backend/.env was created.                          │"
-  echo "  │  Add your Anthropic API key:                        │"
-  echo "  │    ANTHROPIC_API_KEY=sk-ant-...                     │"
+  echo "  │  Add your Google API key:                           │"
+  echo "  │    GOOGLE_API_KEY=AIza...                           │"
   echo "  └─────────────────────────────────────────────────────┘"
   echo ""
   echo "  Then run ./start.sh again."
   exit 1
 fi
 
-if ! grep -q "sk-" "$ROOT/backend/.env" 2>/dev/null; then
-  echo "  ⚠  Set your ANTHROPIC_API_KEY in backend/.env first."
+if ! grep -q "AIza" "$ROOT/backend/.env" 2>/dev/null; then
+  echo "  ⚠  Set your GOOGLE_API_KEY in backend/.env first."
   exit 1
 fi
 
