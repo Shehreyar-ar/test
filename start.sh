@@ -17,7 +17,7 @@ if [ ! -f "$ROOT/backend/.env" ]; then
   exit 1
 fi
 
-if ! grep -q "AIza" "$ROOT/backend/.env" 2>/dev/null; then
+if ! grep -q "GOOGLE_API_KEY=." "$ROOT/backend/.env" 2>/dev/null; then
   echo "  ⚠  Set your GOOGLE_API_KEY in backend/.env first."
   exit 1
 fi
